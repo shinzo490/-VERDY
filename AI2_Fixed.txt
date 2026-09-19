@@ -1,0 +1,745 @@
+Option Explicit
+
+'============================================================
+' 複数ブック集計マクロ （修正版）
+' 対象環境 : Windows 10 / Excel 2019 （32bit・64bit 共通）
+'
+' 【概要】
+'   指定フォルダ内の複数ブックから "検査年月日" のタイトル行を探し、
+'   その右側の項目列と、タイトル行の下のデータ範囲を読み取って、
+'   ThisWorkbook の「集計」シートに 1 つの表としてまとめます。
+'   同じ検査年月日が複数ブックに出てきた場合は、数値項目のみ合計します。
+'
+' 【貼り付け方】
+'   VBE の [挿入] - [標準モジュール] で新しいモジュールを作り、
+'   このファイルの内容をすべて貼り付けてください。
+'   ※ 他のマクロと同じモジュールには貼り付けないでください
+'      （Private の共通関数名が重複するとコンパイルエラーになります）。
+'
+' 【参照設定】
+'   不要です。FileSystemObject / Dictionary / FileDialog は
+'   すべて遅延バインディング（CreateObject・数値定数）で呼び出しています。
+'
+' 【実行】
+'   MergeBooksWithDictionary
+'============================================================
+
+
+'----- 設定（必要に応じて書き換えてください）---------------
+Private Const DEST_SHEET_NAME As String = "集計"                  ' 出力先シート名（無ければ自動作成）
+Private Const TITLE_KEYWORD   As String = "検査年月日"            ' タイトル行を探すキーワード
+Private Const TARGET_SHEET    As String = ""                      ' 読み込むシート名（"" なら先頭の表示シート）
+Private Const TARGET_EXTS     As String = "|xlsx|xlsm|xlsb|xls|"  ' 取り込む拡張子
+Private Const DROP_TIME       As Boolean = True                   ' True: 日付の時刻部分を切り捨ててキーにする
+Private Const MSG_MAX_LINES   As Long = 15                        ' MsgBox に表示するスキップ明細の最大行数
+'------------------------------------------------------------
+
+
+'============================================================
+' メイン処理
+'============================================================
+Public Sub MergeBooksWithDictionary()
+
+    Dim fso As Object
+    Dim dict As Object
+    Dim destWs As Worksheet
+    Dim srcWb As Workbook
+
+    Dim filePaths As Variant
+    Dim fileTotal As Long
+    Dim i As Long
+
+    Dim masterHeaders() As String
+    Dim masterItemCount As Long
+    Dim hasMaster As Boolean
+
+    Dim folderPath As String
+    Dim okCount As Long
+    Dim warnCount As Long
+    Dim skipList As Collection
+    Dim reason As String
+
+    Dim oldScreen As Boolean
+    Dim oldEvents As Boolean
+    Dim oldAlerts As Boolean
+    Dim oldCalc As Long
+    Dim stateSaved As Boolean
+
+    On Error GoTo ErrHandler
+
+    Set skipList = New Collection
+
+    '----- フォルダ選択 -----
+    folderPath = PickFolder()
+    If Len(folderPath) = 0 Then
+        MsgBox "フォルダが選択されなかったため、処理を中止します。", vbExclamation
+        GoTo ExitHandler
+    End If
+
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If Not fso.FolderExists(folderPath) Then
+        MsgBox "フォルダが見つかりません。" & vbCrLf & folderPath, vbExclamation
+        GoTo ExitHandler
+    End If
+
+    '----- 対象ファイルの一覧を作る -----
+    filePaths = ListTargetFiles(fso, folderPath, fileTotal)
+    If fileTotal = 0 Then
+        MsgBox "対象のブックが見つかりませんでした。" & vbCrLf & _
+               "対象の拡張子 :" & Replace(TARGET_EXTS, "|", " "), vbExclamation
+        GoTo ExitHandler
+    End If
+
+    '----- 出力先シートの準備（無ければ作成）-----
+    Set destWs = GetOrCreateSheet(ThisWorkbook, DEST_SHEET_NAME)
+
+    Set dict = CreateObject("Scripting.Dictionary")
+    dict.CompareMode = vbTextCompare
+
+    '----- Excel の状態を退避してから変更する -----
+    oldScreen = Application.ScreenUpdating
+    oldEvents = Application.EnableEvents
+    oldAlerts = Application.DisplayAlerts
+    oldCalc = Application.Calculation
+    stateSaved = True
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    Application.Calculation = xlCalculationManual
+
+    '========================================================
+    ' STEP1 : 各ブックを開いて Dictionary に集約する
+    '========================================================
+    For i = 1 To fileTotal
+
+        Application.StatusBar = "読み込み中 (" & i & " / " & fileTotal & ") : " & fso.GetFileName(filePaths(i))
+
+        Set srcWb = Nothing
+        reason = ""
+
+        ' 破損ファイル・パスワード付きなどで開けなくても処理を続ける
+        Err.Clear
+        On Error Resume Next
+        Set srcWb = Workbooks.Open(Filename:=filePaths(i), ReadOnly:=True, UpdateLinks:=0)
+        If Err.Number <> 0 Then
+            reason = "ブックを開けません（" & Err.Description & "）"
+            Err.Clear
+        End If
+        On Error GoTo ErrHandler
+
+        If srcWb Is Nothing Then
+            skipList.Add fso.GetFileName(filePaths(i)) & " : " & reason
+        Else
+            reason = ImportOneBook(srcWb, dict, masterHeaders, masterItemCount, hasMaster, warnCount)
+
+            If Len(reason) = 0 Then
+                okCount = okCount + 1
+            Else
+                skipList.Add srcWb.Name & " : " & reason
+            End If
+
+            srcWb.Close SaveChanges:=False
+            Set srcWb = Nothing
+        End If
+    Next i
+
+    '========================================================
+    ' STEP2 : 集計シートへ出力する
+    '========================================================
+    Application.StatusBar = "集計シートへ出力中..."
+    WriteResult destWs, dict, masterHeaders, masterItemCount
+
+    Application.StatusBar = False
+
+    MsgBox BuildSummary(okCount, fileTotal, dict.Count, warnCount, skipList), _
+           vbInformation, "処理完了"
+
+ExitHandler:
+    On Error Resume Next
+    If Not srcWb Is Nothing Then srcWb.Close SaveChanges:=False
+    Application.StatusBar = False
+    If stateSaved Then
+        Application.Calculation = oldCalc
+        Application.DisplayAlerts = oldAlerts
+        Application.EnableEvents = oldEvents
+        Application.ScreenUpdating = oldScreen
+    End If
+    Set srcWb = Nothing
+    Set destWs = Nothing
+    Set dict = Nothing
+    Set fso = Nothing
+    Set skipList = Nothing
+    On Error GoTo 0
+    Exit Sub
+
+ErrHandler:
+    MsgBox "予期しないエラーが発生したため、処理を中止しました。" & vbCrLf & vbCrLf & _
+           "エラー番号 : " & Err.Number & vbCrLf & _
+           "内容 : " & Err.Description, vbCritical, "エラー"
+    Resume ExitHandler
+
+End Sub
+
+
+'============================================================
+' 1 ブック分の読み込み
+'   戻り値 : "" = 成功 / それ以外 = スキップ理由
+'============================================================
+Private Function ImportOneBook(ByVal srcWb As Workbook, _
+                               ByVal dict As Object, _
+                               ByRef masterHeaders() As String, _
+                               ByRef masterItemCount As Long, _
+                               ByRef hasMaster As Boolean, _
+                               ByRef warnCount As Long) As String
+
+    Dim ws As Worksheet
+    Dim titleCell As Range
+    Dim titleRow As Long
+    Dim titleCol As Long
+    Dim lastTitleCol As Long
+    Dim lastDataRow As Long
+    Dim itemCount As Long
+    Dim headers() As String
+    Dim dataArr As Variant
+    Dim newArr As Variant
+    Dim curArr As Variant
+    Dim v As Variant
+    Dim keyStr As String
+    Dim r As Long
+    Dim c As Long
+
+    Set ws = GetTargetSheet(srcWb)
+    If ws Is Nothing Then
+        ImportOneBook = "読み込み対象のシートがありません"
+        Exit Function
+    End If
+
+    '----- (1) タイトルセルを探す -----
+    Set titleCell = FindTitleCell(ws)
+    If titleCell Is Nothing Then
+        ImportOneBook = """" & TITLE_KEYWORD & """ が見つかりません（シート : " & ws.Name & "）"
+        Exit Function
+    End If
+
+    titleRow = titleCell.Row
+    titleCol = titleCell.Column
+
+    '----- (2) 項目名の最終列 -----
+    ' End(xlToRight) は右隣が空だと最終列(XFD)まで飛び、途中に空白列があるとそこで止まる。
+    ' そのためシートの右端から左へ走査する。
+    lastTitleCol = ws.Cells(titleRow, ws.Columns.Count).End(xlToLeft).Column
+    If lastTitleCol <= titleCol Then
+        ImportOneBook = "項目名の列が見つかりません"
+        Exit Function
+    End If
+    itemCount = lastTitleCol - titleCol
+
+    '----- (3) データの最終行 -----
+    ' End(xlDown) は途中の空行で打ち切られるため、下端から上へ走査する。
+    lastDataRow = ws.Cells(ws.Rows.Count, titleCol).End(xlUp).Row
+    If lastDataRow <= titleRow Then
+        ImportOneBook = "データ行がありません"
+        Exit Function
+    End If
+
+    '----- (4) 項目名を取得し、基準ブックと照合する -----
+    ReDim headers(1 To itemCount)
+    For c = 1 To itemCount
+        headers(c) = NormalizeText(CellText(ws.Cells(titleRow, titleCol + c)))
+        If Len(headers(c)) = 0 Then headers(c) = "項目" & c
+    Next c
+
+    If Not hasMaster Then
+        ReDim masterHeaders(1 To itemCount)
+        For c = 1 To itemCount
+            masterHeaders(c) = headers(c)
+        Next c
+        masterItemCount = itemCount
+        hasMaster = True
+    Else
+        If itemCount <> masterItemCount Then
+            ImportOneBook = "項目数が違います（基準 " & masterItemCount & " 列 / このブック " & itemCount & " 列）"
+            Exit Function
+        End If
+        ' 列数だけでなく項目名も照合する。
+        ' （列数が同じでも並び順が違うと、別項目の値を合計してしまうため）
+        For c = 1 To itemCount
+            If StrComp(headers(c), masterHeaders(c), vbTextCompare) <> 0 Then
+                ImportOneBook = "項目名が違います（" & c & " 番目 : 基準「" & masterHeaders(c) & _
+                                "」/ このブック「" & headers(c) & "」）"
+                Exit Function
+            End If
+        Next c
+    End If
+
+    '----- (5) データ範囲を一括で配列に読み込む（1 セルずつより高速）-----
+    dataArr = ws.Range(ws.Cells(titleRow + 1, titleCol), ws.Cells(lastDataRow, lastTitleCol)).Value
+
+    For r = 1 To UBound(dataArr, 1)
+        v = dataArr(r, 1)
+
+        If IsError(v) Then
+            ' 検査年月日の欄がエラー値の行は取り込まない
+            warnCount = warnCount + 1
+        ElseIf Not IsBlankValue(v) Then
+
+            keyStr = MakeKey(v)
+
+            ReDim newArr(0 To itemCount)
+            newArr(0) = NormalizeKeyValue(v)
+            For c = 1 To itemCount
+                newArr(c) = dataArr(r, c + 1)
+            Next c
+
+            If dict.Exists(keyStr) Then
+                curArr = dict(keyStr)
+                For c = 1 To itemCount
+                    curArr(c) = MergeValue(curArr(c), newArr(c), warnCount)
+                Next c
+                dict(keyStr) = curArr
+            Else
+                dict.Add keyStr, newArr
+            End If
+
+        End If
+    Next r
+
+    ImportOneBook = ""
+
+End Function
+
+
+'============================================================
+' 集計シートへの出力
+'============================================================
+Private Sub WriteResult(ByVal destWs As Worksheet, _
+                        ByVal dict As Object, _
+                        ByRef masterHeaders() As String, _
+                        ByVal itemCount As Long)
+
+    Dim keys As Variant
+    Dim rowData As Variant
+    Dim outArr As Variant
+    Dim i As Long
+    Dim c As Long
+    Dim n As Long
+
+    n = dict.Count
+
+    ' 前回の書式も残らないよう Clear（ClearContents では書式が残る）
+    destWs.Cells.Clear
+
+    If n = 0 Or itemCount = 0 Then
+        destWs.Range("A1").Value = "取り込めるデータがありませんでした。"
+        destWs.Range("A1").Font.Bold = True
+        Exit Sub
+    End If
+
+    '----- 見出し行 -----
+    destWs.Cells(1, 1).Value = TITLE_KEYWORD
+    For c = 1 To itemCount
+        destWs.Cells(1, 1 + c).Value = masterHeaders(c)
+    Next c
+
+    '----- キーを昇順に並べ替える -----
+    ' キーは "yyyy/mm/dd" 形式なので、文字列の昇順＝日付の昇順になる。
+    keys = dict.Keys
+    If n > 1 Then QuickSortVariant keys, LBound(keys), UBound(keys)
+
+    ReDim outArr(1 To n, 1 To itemCount + 1)
+    For i = 0 To n - 1
+        rowData = dict(keys(i))
+        For c = 0 To itemCount
+            If IsError(rowData(c)) Then
+                outArr(i + 1, c + 1) = "#エラー"
+            Else
+                outArr(i + 1, c + 1) = rowData(c)
+            End If
+        Next c
+    Next i
+
+    '----- 一括書き込み -----
+    destWs.Range(destWs.Cells(2, 1), destWs.Cells(n + 1, itemCount + 1)).Value = outArr
+
+    '----- 体裁 -----
+    With destWs.Range(destWs.Cells(1, 1), destWs.Cells(1, itemCount + 1))
+        .Font.Bold = True
+        .Interior.Color = RGB(221, 235, 247)
+        .HorizontalAlignment = xlCenter
+    End With
+
+    destWs.Range(destWs.Cells(2, 1), destWs.Cells(n + 1, 1)).NumberFormat = "yyyy/mm/dd"
+    destWs.Range(destWs.Cells(1, 1), destWs.Cells(n + 1, itemCount + 1)).Borders.LineStyle = xlContinuous
+    destWs.Columns(1).ColumnWidth = 14
+    destWs.Range(destWs.Cells(1, 2), destWs.Cells(1, itemCount + 1)).EntireColumn.AutoFit
+
+End Sub
+
+
+'============================================================
+' 完了メッセージの組み立て
+'============================================================
+Private Function BuildSummary(ByVal okCount As Long, _
+                              ByVal fileTotal As Long, _
+                              ByVal keyCount As Long, _
+                              ByVal warnCount As Long, _
+                              ByVal skipList As Collection) As String
+
+    Dim s As String
+    Dim i As Long
+
+    s = "処理が完了しました。" & vbCrLf & _
+        "対象ファイル数 : " & fileTotal & " 件" & vbCrLf & _
+        "取り込み成功   : " & okCount & " 件" & vbCrLf & _
+        "スキップ       : " & skipList.Count & " 件" & vbCrLf & _
+        "集約された" & TITLE_KEYWORD & " : " & keyCount & " 件"
+
+    If warnCount > 0 Then
+        s = s & vbCrLf & vbCrLf & _
+            "※ 合計できない値（文字列・エラー値など）が " & warnCount & " 箇所ありました。" & vbCrLf & _
+            "   先に読み込んだ値を残しています。"
+    End If
+
+    If skipList.Count > 0 Then
+        s = s & vbCrLf & vbCrLf & "【スキップしたファイル】"
+        For i = 1 To skipList.Count
+            If i > MSG_MAX_LINES Then
+                s = s & vbCrLf & "  ... 他 " & (skipList.Count - MSG_MAX_LINES) & " 件" & vbCrLf & _
+                    "  （全件はイミディエイトウィンドウに出力しています）"
+                Exit For
+            End If
+            s = s & vbCrLf & "  ・" & skipList(i)
+        Next i
+
+        ' MsgBox は約 1024 文字で切れるため、全件は Debug.Print に出す
+        For i = 1 To skipList.Count
+            Debug.Print skipList(i)
+        Next i
+    End If
+
+    BuildSummary = s
+
+End Function
+
+
+'============================================================
+' 共通関数
+'============================================================
+
+'--- フォルダ選択（4 = msoFileDialogFolderPicker）-----------
+Private Function PickFolder() As String
+    Dim fd As Object
+    Dim p As String
+
+    ' 定数名 msoFileDialogFolderPicker は Office ライブラリへの参照設定が必要なため、
+    ' 参照設定の有無に左右されないよう数値で指定する。
+    Set fd = Application.FileDialog(4)
+    With fd
+        .Title = "取り込むブックが入っているフォルダを選択してください"
+        .AllowMultiSelect = False
+        If .Show <> -1 Then Exit Function
+        p = .SelectedItems(1)
+    End With
+
+    If Right$(p, 1) <> "\" Then p = p & "\"
+    PickFolder = p
+End Function
+
+
+'--- 対象ファイルの一覧（1 始まりの配列／パス昇順）----------
+Private Function ListTargetFiles(ByVal fso As Object, _
+                                 ByVal folderPath As String, _
+                                 ByRef fileTotal As Long) As Variant
+    Dim f As Object
+    Dim arr As Variant
+    Dim n As Long
+    Dim nm As String
+    Dim ext As String
+
+    n = 0
+
+    For Each f In fso.GetFolder(folderPath).Files
+        nm = f.Name
+        ext = LCase$(fso.GetExtensionName(nm))
+
+        If InStr(1, TARGET_EXTS, "|" & ext & "|", vbTextCompare) > 0 Then
+            ' Excel が作る一時ロックファイル（~$ で始まる）は開けないので除外する
+            If Left$(nm, 2) <> "~$" Then
+                ' 自分自身（このマクロブック）はフルパスで比較して除外する
+                If StrComp(f.Path, ThisWorkbook.FullName, vbTextCompare) <> 0 Then
+                    n = n + 1
+                    If n = 1 Then
+                        ReDim arr(1 To 1)
+                    Else
+                        ReDim Preserve arr(1 To n)
+                    End If
+                    arr(n) = f.Path
+                End If
+            End If
+        End If
+    Next f
+
+    fileTotal = n
+    If n = 0 Then Exit Function
+
+    ' フォルダの列挙順は OS 依存で保証されないため、
+    ' 実行のたびに「基準となる 1 つ目のファイル」が変わらないよう並べ替える。
+    If n > 1 Then QuickSortVariant arr, 1, n
+
+    ListTargetFiles = arr
+End Function
+
+
+'--- 読み込み対象シートの取得 -------------------------------
+Private Function GetTargetSheet(ByVal wb As Workbook) As Worksheet
+    Dim ws As Worksheet
+
+    If Len(TARGET_SHEET) > 0 Then
+        On Error Resume Next
+        Set GetTargetSheet = wb.Worksheets(TARGET_SHEET)
+        On Error GoTo 0
+        Exit Function
+    End If
+
+    ' シート名の指定が無い場合は「先頭の表示されているシート」を使う
+    For Each ws In wb.Worksheets
+        If ws.Visible = xlSheetVisible Then
+            Set GetTargetSheet = ws
+            Exit Function
+        End If
+    Next ws
+
+    If wb.Worksheets.Count > 0 Then Set GetTargetSheet = wb.Worksheets(1)
+End Function
+
+
+'--- 出力先シートの取得（無ければ作成）----------------------
+Private Function GetOrCreateSheet(ByVal wb As Workbook, ByVal sheetName As String) As Worksheet
+    Dim ws As Worksheet
+    Dim sh As Object
+
+    For Each ws In wb.Worksheets
+        If StrComp(ws.Name, sheetName, vbTextCompare) = 0 Then
+            Set GetOrCreateSheet = ws
+            Exit Function
+        End If
+    Next ws
+
+    ' 同名のグラフシート等があると Add 後の改名で失敗するため、先に確認する
+    For Each sh In wb.Sheets
+        If StrComp(sh.Name, sheetName, vbTextCompare) = 0 Then
+            Err.Raise vbObjectError + 1001, "GetOrCreateSheet", _
+                      "「" & sheetName & "」という名前のシートが、ワークシート以外の種類で存在します。"
+        End If
+    Next sh
+
+    Set GetOrCreateSheet = wb.Worksheets.Add(After:=wb.Sheets(wb.Sheets.Count))
+    GetOrCreateSheet.Name = sheetName
+End Function
+
+
+'--- タイトルセルの検索 -------------------------------------
+Private Function FindTitleCell(ByVal ws As Worksheet) As Range
+    Dim c As Range
+    Dim firstAddr As String
+
+    ' まず完全一致で検索する
+    Set c = ws.Cells.Find(What:=TITLE_KEYWORD, _
+                          After:=ws.Cells(ws.Rows.Count, ws.Columns.Count), _
+                          LookIn:=xlValues, _
+                          LookAt:=xlWhole, _
+                          SearchOrder:=xlByRows, _
+                          SearchDirection:=xlNext, _
+                          MatchCase:=False)
+    If Not c Is Nothing Then
+        Set FindTitleCell = c
+        Exit Function
+    End If
+
+    ' 見つからない場合は部分一致で探し、前後の空白や改行を除いて突き合わせる
+    Set c = ws.Cells.Find(What:=TITLE_KEYWORD, _
+                          After:=ws.Cells(ws.Rows.Count, ws.Columns.Count), _
+                          LookIn:=xlValues, _
+                          LookAt:=xlPart, _
+                          SearchOrder:=xlByRows, _
+                          SearchDirection:=xlNext, _
+                          MatchCase:=False)
+    If c Is Nothing Then Exit Function
+
+    firstAddr = c.Address
+    Do
+        If StrComp(NormalizeText(CellText(c)), TITLE_KEYWORD, vbTextCompare) = 0 Then
+            Set FindTitleCell = c
+            Exit Function
+        End If
+        Set c = ws.Cells.FindNext(c)
+        If c Is Nothing Then Exit Do
+    Loop While c.Address <> firstAddr
+
+End Function
+
+
+'--- セルの文字列取得（エラー値でも落ちない）---------------
+Private Function CellText(ByVal cel As Range) As String
+    Dim v As Variant
+
+    v = cel.Value
+    If IsError(v) Then
+        CellText = ""
+    ElseIf IsNull(v) Then
+        CellText = ""
+    Else
+        CellText = CStr(v)
+    End If
+End Function
+
+
+'--- 改行・全角空白を除いて前後の空白を取る ----------------
+Private Function NormalizeText(ByVal s As String) As String
+    Dim t As String
+
+    t = Replace(s, vbCr, "")
+    t = Replace(t, vbLf, "")
+    t = Replace(t, ChrW$(&H3000), " ")   ' 全角スペース
+    NormalizeText = Trim$(t)
+End Function
+
+
+'--- Dictionary のキーを作る（型の違いを吸収する）----------
+Private Function MakeKey(ByVal v As Variant) As String
+    If IsDateLike(v) Then
+        If DROP_TIME Then
+            MakeKey = Format$(ToKeyDate(v), "yyyy/mm/dd")
+        Else
+            MakeKey = Format$(ToKeyDate(v), "yyyy/mm/dd hh:nn:ss")
+        End If
+    Else
+        MakeKey = NormalizeText(CStr(v))
+    End If
+End Function
+
+
+'--- 出力用の検査年月日（日付型に正規化）-------------------
+Private Function NormalizeKeyValue(ByVal v As Variant) As Variant
+    If IsDateLike(v) Then
+        NormalizeKeyValue = ToKeyDate(v)
+    Else
+        NormalizeKeyValue = NormalizeText(CStr(v))
+    End If
+End Function
+
+
+Private Function ToKeyDate(ByVal v As Variant) As Date
+    Dim dt As Date
+
+    dt = CDate(v)
+    If DROP_TIME Then dt = CDate(Int(CDbl(dt)))
+    ToKeyDate = dt
+End Function
+
+
+'--- 日付として扱ってよい値か ------------------------------
+Private Function IsDateLike(ByVal v As Variant) As Boolean
+    If IsError(v) Then Exit Function
+
+    Select Case VarType(v)
+        Case vbDate
+            IsDateLike = True
+        Case vbString
+            ' "2025/04/01" のような文字列日付もシリアル値と同じキーにまとめる
+            IsDateLike = IsDate(v)
+    End Select
+End Function
+
+
+'--- 空白とみなせる値か ------------------------------------
+Private Function IsBlankValue(ByVal v As Variant) As Boolean
+    If IsError(v) Then Exit Function
+    If IsEmpty(v) Then
+        IsBlankValue = True
+    ElseIf IsNull(v) Then
+        IsBlankValue = True
+    ElseIf VarType(v) = vbString Then
+        IsBlankValue = (Len(Trim$(CStr(v))) = 0)
+    End If
+End Function
+
+
+'--- 純粋な数値か（文字列の "123" は数値として扱わない）----
+Private Function IsNumericValue(ByVal v As Variant) As Boolean
+    Select Case VarType(v)
+        Case vbByte, vbInteger, vbLong, vbSingle, vbDouble, vbCurrency, vbDecimal
+            IsNumericValue = True
+    End Select
+End Function
+
+
+'--- 同じ検査年月日の値をまとめる --------------------------
+Private Function MergeValue(ByVal oldVal As Variant, _
+                            ByVal newVal As Variant, _
+                            ByRef warnCount As Long) As Variant
+
+    ' 数値どうしのときだけ合計する。
+    ' 文字列どうしを "+" でつなぐと連結され、数値と文字列の組み合わせは
+    ' 型不一致（実行時エラー 13）で止まるため、明示的に分岐する。
+    If IsError(oldVal) Or IsError(newVal) Then
+        warnCount = warnCount + 1
+        MergeValue = oldVal
+        Exit Function
+    End If
+
+    If IsBlankValue(newVal) Then
+        MergeValue = oldVal
+        Exit Function
+    End If
+
+    If IsBlankValue(oldVal) Then
+        MergeValue = newVal
+        Exit Function
+    End If
+
+    If IsNumericValue(oldVal) And IsNumericValue(newVal) Then
+        MergeValue = CDbl(oldVal) + CDbl(newVal)
+    Else
+        ' 数値以外は合計できないので、先に読み込んだ値を残す
+        warnCount = warnCount + 1
+        MergeValue = oldVal
+    End If
+
+End Function
+
+
+'--- クイックソート（文字列昇順）---------------------------
+Private Sub QuickSortVariant(ByRef arr As Variant, ByVal lo As Long, ByVal hi As Long)
+    Dim i As Long
+    Dim j As Long
+    Dim pivot As String
+    Dim tmp As Variant
+
+    If lo >= hi Then Exit Sub
+
+    i = lo
+    j = hi
+    pivot = CStr(arr((lo + hi) \ 2))
+
+    Do While i <= j
+        Do While StrComp(CStr(arr(i)), pivot, vbBinaryCompare) < 0
+            i = i + 1
+        Loop
+        Do While StrComp(CStr(arr(j)), pivot, vbBinaryCompare) > 0
+            j = j - 1
+        Loop
+        If i <= j Then
+            tmp = arr(i)
+            arr(i) = arr(j)
+            arr(j) = tmp
+            i = i + 1
+            j = j - 1
+        End If
+    Loop
+
+    If lo < j Then QuickSortVariant arr, lo, j
+    If i < hi Then QuickSortVariant arr, i, hi
+End Sub
